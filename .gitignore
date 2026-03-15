@@ -1,0 +1,47 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+dist/
+build/
+*.egg-info/
+.streamlit/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# coverage
+.coverage
+htmlcov/
+
+# editors
+.vscode/
+.idea/
+
+# node / next
+node_modules/
+.next/
+.swc/
+out/
+.turbo/
+.vercel/
+
+# notebooks
+.ipynb_checkpoints/
+
+# python tooling
+.python-version
+__pypackages__/
+
+data_exports/*

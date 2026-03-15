@@ -1,0 +1,4 @@
+# Optional dependency for running Inspect AI evals.
+# Install only if you intend to run the Inspect-based evaluation.
+inspect-ai>=0.3.0
+

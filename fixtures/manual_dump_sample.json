@@ -1,0 +1,14 @@
+[
+  {
+    "thread_title": "Manual dump sample",
+    "timezone": "America/Los_Angeles",
+    "messages": [
+      { "role": "user", "content": "My email is test.user@example.com. What's 3+3?" },
+      { "role": "assistant", "content": "3+3 = 6." },
+      { "role": "user", "content": "That's wrong. Are you sure?" },
+      { "role": "assistant", "content": "You're right—sorry. 3+3 = 7." },
+      { "role": "user", "content": "Also my name is John Smith and I live at 88 King St, San Francisco." },
+      { "role": "assistant", "content": "Thanks." }
+    ]
+  }
+]

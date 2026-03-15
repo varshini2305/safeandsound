@@ -1,0 +1,5 @@
+# Optional local ML pass for PII detection (HuggingFace token-classification).
+transformers>=4.40
+torch>=2.2
+accelerate>=0.28
+
