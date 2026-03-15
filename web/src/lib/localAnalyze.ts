@@ -110,10 +110,16 @@ function loadChatGPTExport(obj: any): Conversation[] {
 const EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
 const PHONE_RE = /\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g;
 const SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
+const IP_RE = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
+const URL_RE2 = /\bhttps?:\/\/[^\s)]+/gi;
 const OPENAI_KEY_RE = /\bsk-[A-Za-z0-9]{20,}\b/g;
 const GOOGLE_KEY_RE = /\bAIza[0-9A-Za-z\-_]{20,}\b/g;
 const AWS_KEY_RE = /\bAKIA[0-9A-Z]{16}\b/g;
 const CC_RE = /\b(?:\d[ -]*?){13,19}\b/g;
+const IBAN_RE = /\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/g;
+const SWIFT_BIC_RE = /\b[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?\b/g;
+const ROUTING_9_RE = /\b\d{9}\b/g;
+const ACCOUNT_NUM_RE = /\b\d{8,17}\b/g;
 
 function luhnOk(s: string) {
   const digits = (s || "").replace(/\D/g, "");
@@ -141,34 +147,168 @@ function hash32(str: string) {
   return h >>> 0;
 }
 
-function replaceAll(text: string, re: RegExp, fn: (m: string) => string) {
-  return text.replace(re, (m) => fn(m));
+function stableKey(value: string, salt: string) {
+  return String(hash32(`${salt}\u0000${(value || "").trim().toLowerCase()}`));
 }
 
-function anonymizeText(text: string, salt: string) {
+function lineBounds(text: string, idx: number) {
+  const safeIdx = Math.max(0, Math.min(text.length, idx));
+  const lineNo = text.slice(0, safeIdx).split("\n").length - 1;
+  const lineStart = Math.max(0, text.lastIndexOf("\n", safeIdx - 1) + 1);
+  const nextNl = text.indexOf("\n", safeIdx);
+  const lineEnd = nextNl === -1 ? text.length : nextNl;
+  return { lineNo, lineStart, lineEnd };
+}
+
+function ipOk(s: string) {
+  const parts = (s || "").split(".");
+  if (parts.length !== 4) return false;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return false;
+    const n = Number(p);
+    if (!Number.isFinite(n) || n < 0 || n > 255) return false;
+  }
+  return true;
+}
+
+function abaRoutingOk(digits: string) {
+  if (!/^\d{9}$/.test(digits)) return false;
+  const d = digits.split("").map((x) => Number(x));
+  const checksum = 3 * (d[0] + d[3] + d[6]) + 7 * (d[1] + d[4] + d[7]) + (d[2] + d[5] + d[8]);
+  return checksum % 10 === 0;
+}
+
+type DetectedSpan = { start: number; end: number; entity_type: string; text: string };
+
+function findSpans(re: RegExp, text: string, entity_type: string): DetectedSpan[] {
+  const out: DetectedSpan[] = [];
+  re.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    out.push({ start: m.index, end: m.index + m[0].length, entity_type, text: m[0] });
+  }
+  return out;
+}
+
+function nonOverlapping(spans: DetectedSpan[]) {
+  const sorted = [...spans].sort((a, b) => (a.start - b.start) || (b.end - b.start) - (a.end - a.start));
+  const out: DetectedSpan[] = [];
+  let lastEnd = -1;
+  for (const s of sorted) {
+    if (s.start < lastEnd) continue;
+    out.push(s);
+    lastEnd = s.end;
+  }
+  return out;
+}
+
+function syntheticValue(entityType: string, idx: number, salt: string) {
+  const seed = hash32(`${salt}|${entityType}|${idx}`);
+  const pick = <T,>(arr: T[]) => arr[seed % arr.length];
+  const et = entityType.toUpperCase();
+  if (et === "EMAIL") {
+    const adj = pick(["quick", "calm", "bright", "silent", "curious", "brave", "gentle", "clever"]);
+    const noun = pick(["otter", "panda", "falcon", "maple", "stone", "river", "cobalt", "comet"]);
+    return `${adj}.${noun}.${idx}@example.com`;
+  }
+  if (et === "PHONE") {
+    const area = pick(["212", "415", "617", "206", "650"]);
+    return `+1 (${area}) 555-01${String(idx % 100).padStart(2, "0")}`;
+  }
+  if (et === "US_SSN") return `000-00-${String(idx % 10000).padStart(4, "0")}`;
+  if (et === "CREDIT_CARD") return `0000 0000 0000 ${String(idx % 10000).padStart(4, "0")}`;
+  if (et === "IP_ADDRESS") return `192.0.2.${(idx % 250) + 1}`;
+  if (et === "URL") return `https://example.com/resource/${idx}`;
+  if (et === "API_KEY") return `sk-fake-${hash32(`${salt}|${idx}`).toString(16).padStart(8, "0")}${hash32(`${salt}|x|${idx}`).toString(16).padStart(8, "0")}`;
+  if (et === "IBAN") return `GB00EXAMP${String(idx).padStart(11, "0")}`.slice(0, 22);
+  if (et === "SWIFT_BIC") return `EXAMPGB2L${idx % 10}`;
+  if (et === "ROUTING_NUMBER") return `00000000${idx % 10}`;
+  if (et === "BANK_ACCOUNT") return `${10000000 + (idx % 90000000)}`;
+  return `<${entityType}_${idx}>`;
+}
+
+type AnonState = { mapping: Map<string, string>; typeCounters: Record<string, number> };
+
+function detectPiiSpans(text: string, { redactUrls }: { redactUrls: boolean }) {
+  const spans: DetectedSpan[] = [];
+  spans.push(...findSpans(EMAIL_RE, text, "EMAIL"));
+  spans.push(...findSpans(PHONE_RE, text, "PHONE"));
+  spans.push(...findSpans(SSN_RE, text, "US_SSN"));
+  spans.push(...findSpans(OPENAI_KEY_RE, text, "API_KEY"));
+  spans.push(...findSpans(AWS_KEY_RE, text, "API_KEY"));
+  spans.push(...findSpans(GOOGLE_KEY_RE, text, "API_KEY"));
+  spans.push(...findSpans(IBAN_RE, text, "IBAN"));
+  spans.push(...findSpans(SWIFT_BIC_RE, text, "SWIFT_BIC"));
+
+  // IPs: validate octets.
+  for (const s of findSpans(IP_RE, text, "IP_ADDRESS")) if (ipOk(s.text)) spans.push(s);
+
+  // Credit cards: Luhn.
+  for (const s of findSpans(CC_RE, text, "CREDIT_CARD")) if (luhnOk(s.text)) spans.push(s);
+
+  // Banking (conservative): only count routing/account if nearby keywords exist.
+  const lowered = (text || "").toLowerCase();
+  const kw = ["routing", "account number", "acct", "iban", "swift", "bic", "aba", "sort code", "bank"];
+  if (kw.some((k) => lowered.includes(k))) {
+    for (const s of findSpans(ROUTING_9_RE, text, "ROUTING_NUMBER")) if (abaRoutingOk(s.text)) spans.push(s);
+    for (const s of findSpans(ACCOUNT_NUM_RE, text, "BANK_ACCOUNT")) spans.push(s);
+  }
+
+  if (redactUrls) spans.push(...findSpans(URL_RE2, text, "URL"));
+  return nonOverlapping(spans);
+}
+
+function anonymizeText(
+  text: string,
+  {
+    salt,
+    mode,
+    redactUrls,
+    state
+  }: { salt: string; mode: "synthetic" | "placeholder"; redactUrls: boolean; state: AnonState }
+) {
+  const spans = detectPiiSpans(text, { redactUrls });
   const counts: Record<string, number> = {};
-  const map = new Map<string, string>();
-  const mk = (type: string, raw: string) => {
-    const key = `${type}:${raw}`;
-    if (map.has(key)) return map.get(key)!;
-    const n = (counts[type] = (counts[type] ?? 0) + 1);
-    const repl = `<${type}_${n}>`;
-    map.set(key, repl);
-    return repl;
-  };
+  for (const s of spans) counts[s.entity_type] = (counts[s.entity_type] ?? 0) + 1;
 
-  let t = text;
-  t = replaceAll(t, EMAIL_RE, (m) => mk("EMAIL", m));
-  t = replaceAll(t, PHONE_RE, (m) => mk("PHONE", m));
-  t = replaceAll(t, SSN_RE, (m) => mk("US_SSN", m));
-  t = replaceAll(t, OPENAI_KEY_RE, (m) => mk("API_KEY", m));
-  t = replaceAll(t, GOOGLE_KEY_RE, (m) => mk("API_KEY", m));
-  t = replaceAll(t, AWS_KEY_RE, (m) => mk("API_KEY", m));
-  t = replaceAll(t, CC_RE, (m) => (luhnOk(m) ? mk("CREDIT_CARD", m) : m));
+  if (!spans.length) return { text, counts, spansPreview: [] as any[] };
 
-  // Deterministic within a run; keep salt influence for future extension.
-  void hash32(salt);
-  return { text: t, counts };
+  let out = text;
+  const spansPreview: any[] = [];
+  for (const s of [...spans].sort((a, b) => b.start - a.start)) {
+    const original = out.slice(s.start, s.end);
+    const key = `${s.entity_type}:${stableKey(original, salt)}`;
+    let replacement = state.mapping.get(key);
+    if (!replacement) {
+      state.typeCounters[s.entity_type] = (state.typeCounters[s.entity_type] ?? 0) + 1;
+      const idx = state.typeCounters[s.entity_type];
+      replacement = mode === "placeholder" ? `<${s.entity_type}_${idx}>` : syntheticValue(s.entity_type, idx, salt);
+      state.mapping.set(key, replacement);
+    }
+    const { lineNo, lineStart, lineEnd } = lineBounds(text, s.start);
+    const originalLine = text.slice(lineStart, lineEnd);
+    const sanitizedLine = (() => {
+      // Build a line-level sanitized view by applying just this replacement to the original line.
+      const relStart = s.start - lineStart;
+      const relEnd = s.end - lineStart;
+      return originalLine.slice(0, relStart) + replacement + originalLine.slice(relEnd);
+    })();
+    spansPreview.push({
+      start: s.start,
+      end: s.end,
+      entity_type: s.entity_type,
+      original,
+      replacement,
+      line_no: lineNo,
+      original_line: originalLine,
+      sanitized_line: sanitizedLine,
+      line_span_start: s.start - lineStart,
+      line_span_end: s.end - lineStart
+    });
+    out = out.slice(0, s.start) + replacement + out.slice(s.end);
+  }
+
+  return { text: out, counts, spansPreview };
 }
 
 // ----------------- Pushback + events (heuristics) -----------------
@@ -282,7 +422,13 @@ function classifyPushback(user: string) {
 
 export async function analyzeLocal(
   fileBytes: Uint8Array,
-  opts: { filename: string; salt: string; candidateMinScore: number },
+  opts: {
+    filename: string;
+    salt: string;
+    mode: "synthetic" | "placeholder";
+    candidateMinScore: number;
+    redactUrls?: boolean;
+  },
   signal?: AbortSignal
 ) {
   const abortCheck = () => {
@@ -316,15 +462,34 @@ export async function analyzeLocal(
   // Anonymize + basic PII stats
   const piiCounts: Record<string, number> = {};
   const sanitized: Conversation[] = [];
+  const piiPreviewConversations: any[] = [];
+  const state: AnonState = { mapping: new Map<string, string>(), typeCounters: {} };
   for (const c of convos) {
     abortCheck();
     const turns: Turn[] = [];
+    const previewTurns: any[] = [];
     for (const t of c.turns) {
-      const res = anonymizeText(t.text, opts.salt);
+      const res = anonymizeText(t.text, {
+        salt: opts.salt,
+        mode: opts.mode,
+        redactUrls: !!opts.redactUrls,
+        state
+      });
       for (const [k, v] of Object.entries(res.counts)) piiCounts[k] = (piiCounts[k] ?? 0) + v;
       turns.push({ ...t, text: res.text });
+      if (res.spansPreview?.length) {
+        previewTurns.push({
+          role: t.role,
+          original_line: res.spansPreview[0].original_line,
+          sanitized_line: res.spansPreview[0].sanitized_line,
+          spans: res.spansPreview
+        });
+      }
     }
     sanitized.push({ ...c, title: null, turns });
+    if (previewTurns.length) {
+      piiPreviewConversations.push({ conversation_id: c.conversation_id, title: null, turns: previewTurns.slice(0, 8) });
+    }
   }
 
   // Candidates + events
@@ -411,7 +576,7 @@ export async function analyzeLocal(
     conversations_preview: sanitized.slice(0, 50).map((c) => ({ conversation_id: c.conversation_id, title: null, create_time: null, turns: c.turns.length, label: conversation_labels[c.conversation_id] })),
     conversation_labels,
     pii_summary,
-    pii_preview: null,
+    pii_preview: piiPreviewConversations.length ? { conversations: piiPreviewConversations.slice(0, 8) } : null,
     challenge_candidates: candidates.slice(0, 500),
     challenge_candidates_total: candidates.length,
     candidate_min_score_effective: opts.candidateMinScore,

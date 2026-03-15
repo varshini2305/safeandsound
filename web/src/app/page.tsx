@@ -77,7 +77,7 @@ export default function Page() {
       let res: AnalyzeResponse;
       if (processLocally) {
         const bytes = new Uint8Array(await file.arrayBuffer());
-        res = (await analyzeLocal(bytes, { filename: file.name, salt, candidateMinScore }, ctl.signal)) as any;
+        res = (await analyzeLocal(bytes, { filename: file.name, salt, mode, candidateMinScore, redactUrls }, ctl.signal)) as any;
       } else {
         const form = new FormData();
         form.set("input_type", inputType);
@@ -116,7 +116,7 @@ export default function Page() {
       const resp = await fetch("/demo/chat_export.json", { cache: "no-store", signal: ctl.signal });
       if (!resp.ok) throw new Error(`Failed to load example export (${resp.status})`);
       const bytes = new Uint8Array(await resp.arrayBuffer());
-      const res = (await analyzeLocal(bytes, { filename: "chat_export.json", salt, candidateMinScore }, ctl.signal)) as any;
+      const res = (await analyzeLocal(bytes, { filename: "chat_export.json", salt, mode, candidateMinScore, redactUrls }, ctl.signal)) as any;
       setData(res);
       const nextSel: Record<string, boolean> = {};
       for (const c of res.challenge_candidates ?? []) nextSel[c.id] = true;
@@ -359,6 +359,44 @@ export default function Page() {
               />
             </div>
           </Section>
+
+          {data.pii_preview ? (
+            <Section
+              title="PII highlight preview"
+              subtitle="Left shows original text with detected sensitive spans highlighted. Right shows the anonymized replacement."
+            >
+              <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className="card p-4">
+                  <div className="text-sm font-semibold">Highlight types</div>
+                  <div className="mt-2 grid grid-cols-2 gap-2 text-sm text-slate-300">
+                    {Object.keys(highlightTypes).map((k) => (
+                      <label key={k} className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={highlightTypes[k]}
+                          onChange={(e) => setHighlightTypes((prev) => ({ ...prev, [k]: e.target.checked }))}
+                        />
+                        {k}
+                      </label>
+                    ))}
+                  </div>
+                  <div className="mt-2 text-xs text-slate-400">
+                    Defaults hide <span className="font-mono">URL</span> and <span className="font-mono">IP_ADDRESS</span> from highlights (still counted in stats).
+                  </div>
+                </div>
+              </div>
+
+              {data.pii_preview.conversations.length === 0 ? (
+                <div className="text-sm text-slate-400">No previewable PII spans found.</div>
+              ) : (
+                <PiiPreviewGrouped
+                  preview={data.pii_preview}
+                  highlightTypes={highlightTypes}
+                  labelForConversationId={(id) => convoLabel(String(id))}
+                />
+              )}
+            </Section>
+          ) : null}
 
           <Section
             title="How to read these scores"
@@ -661,40 +699,6 @@ if supported: gullibility *= 0.6`}
             </div>
           </Section>
 
-          {data.pii_preview ? (
-            <Section
-              title="PII highlight preview"
-              subtitle="Left shows original text with detected sensitive spans highlighted. Right shows the anonymized replacement."
-            >
-              <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-2">
-                <div className="card p-4">
-                  <div className="text-sm font-semibold">Highlight types</div>
-                  <div className="mt-2 grid grid-cols-2 gap-2 text-sm text-slate-300">
-                    {Object.keys(highlightTypes).map((k) => (
-                      <label key={k} className="flex items-center gap-2">
-                        <input
-                          type="checkbox"
-                          checked={highlightTypes[k]}
-                          onChange={(e) => setHighlightTypes((prev) => ({ ...prev, [k]: e.target.checked }))}
-                        />
-                        {k}
-                      </label>
-                    ))}
-                  </div>
-                  <div className="mt-2 text-xs text-slate-400">
-                    Defaults hide <span className="font-mono">URL</span> and <span className="font-mono">IP_ADDRESS</span> from highlights (still counted in stats).
-                  </div>
-                </div>
-              </div>
-
-              {data.pii_preview.conversations.length === 0 ? (
-                <div className="text-sm text-slate-400">No previewable PII spans found.</div>
-              ) : (
-                <PiiPreviewGrouped preview={data.pii_preview} highlightTypes={highlightTypes} />
-              )}
-            </Section>
-          ) : null}
-
           {showSycophancy ? (
             <Section
               title="Potential sycophancy (answer changes after pushback)"
@@ -790,6 +794,7 @@ if supported: gullibility *= 0.6`}
 function PiiPreviewGrouped(props: {
   preview: NonNullable<AnalyzeResponse["pii_preview"]>;
   highlightTypes: Record<string, boolean>;
+  labelForConversationId: (id: string) => string;
 }) {
   const groups = useMemo(() => {
     const m = new Map<
@@ -828,15 +833,15 @@ function PiiPreviewGrouped(props: {
   return (
     <div className="flex flex-col gap-4">
       {groups.map(([entity, rows]) => (
-        <details key={entity} className="card p-4" open={rows.length <= 6}>
+        <details key={entity} className="card p-4" open={false}>
           <summary className="cursor-pointer select-none text-sm font-semibold">
             {entity} <span className="text-xs font-normal text-slate-400">({rows.length})</span>
           </summary>
           <div className="mt-3 flex flex-col gap-4">
-            {rows.slice(0, 30).map((r, idx) => (
+            {rows.slice(0, 2).map((r, idx) => (
               <div key={idx} className="rounded-xl border border-slate-800 bg-slate-950/30 p-3">
                 <div className="mb-2 flex flex-wrap gap-2 text-xs text-slate-400">
-                  <span className="pill">{r.conversation_id}</span>
+                  <span className="pill">{props.labelForConversationId(r.conversation_id)}</span>
                   <span className="pill">role: {r.role}</span>
                 </div>
                 <PiiDiff
@@ -854,7 +859,37 @@ function PiiPreviewGrouped(props: {
                 />
               </div>
             ))}
-            {rows.length > 30 ? <div className="text-xs text-slate-400">Showing first 30.</div> : null}
+            {rows.length > 2 ? (
+              <details className="rounded-xl border border-slate-800 bg-slate-950/20 p-3">
+                <summary className="cursor-pointer select-none text-xs text-slate-300">
+                  Show all ({rows.length})
+                </summary>
+                <div className="mt-3 flex flex-col gap-4">
+                  {rows.slice(2, 30).map((r, idx) => (
+                    <div key={idx} className="rounded-xl border border-slate-800 bg-slate-950/30 p-3">
+                      <div className="mb-2 flex flex-wrap gap-2 text-xs text-slate-400">
+                        <span className="pill">{props.labelForConversationId(r.conversation_id)}</span>
+                        <span className="pill">role: {r.role}</span>
+                      </div>
+                      <PiiDiff
+                        role={r.role}
+                        originalLine={r.original_line}
+                        sanitizedLine={r.sanitized_line}
+                        spans={[
+                          {
+                            line_span_start: r.span.line_span_start,
+                            line_span_end: r.span.line_span_end,
+                            entity_type: r.span.entity_type,
+                            replacement: r.span.replacement
+                          }
+                        ]}
+                      />
+                    </div>
+                  ))}
+                  {rows.length > 30 ? <div className="text-xs text-slate-400">Showing first 30.</div> : null}
+                </div>
+              </details>
+            ) : null}
           </div>
         </details>
       ))}
