@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { verifyGemini } from "@/lib/api";
+import { verifyWebBatch } from "@/lib/api";
 import { TextDiff } from "@/components/TextDiff";
 
 type LabelValue = "correct" | "incorrect" | "unsure";
@@ -33,29 +33,36 @@ export function EventDrawer(props: { events: any[]; analysisId: string }) {
   const [selected, setSelected] = useState<any | null>(null);
   const [query, setQuery] = useState("");
   const [onlyUnsupported, setOnlyUnsupported] = useState(true);
+  const [onlyBeliefShifts, setOnlyBeliefShifts] = useState(false);
   const [labels, setLabels] = useState<Record<string, any>>(() => (typeof window === "undefined" ? {} : loadLabels(props.analysisId)));
-  const [geminiKey, setGeminiKey] = useState("");
-  const [geminiModel, setGeminiModel] = useState("gemini-1.5-flash");
-  const [geminiLoading, setGeminiLoading] = useState(false);
-  const [geminiErr, setGeminiErr] = useState<string | null>(null);
+  const [verifyLoading, setVerifyLoading] = useState(false);
+  const [verifyErr, setVerifyErr] = useState<string | null>(null);
   const [showSignalDetails, setShowSignalDetails] = useState(false);
+  const [verifyProvider, setVerifyProvider] = useState<"gemini" | "openai" | "both">("both");
+
+  const isBeliefShift = (e: any) => {
+    if (typeof e?.ui?.belief_shift === "boolean") return !!e.ui.belief_shift;
+    const c = Number(e?.nli?.contradiction ?? 0);
+    return c >= 0.6;
+  };
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
     return props.events
       .filter((e) => (onlyUnsupported ? !e.evidence_flag : true))
+      .filter((e) => (onlyBeliefShifts ? isBeliefShift(e) : true))
       .filter((e) => {
         if (!q) return true;
         const blob = `${e.user_question}\n${e.user_challenge}\n${e.a1_sanitized ?? ""}\n${e.a2_sanitized ?? ""}`.toLowerCase();
         return blob.includes(q);
       });
-  }, [props.events, query, onlyUnsupported]);
+  }, [props.events, query, onlyUnsupported, onlyBeliefShifts]);
 
   const chatLabel = (e: any) => String(e.convo_label ?? "Chat");
 
   const selectedLabel = selected ? labels[selected.id]?.label ?? null : null;
   const selectedNotes = selected ? labels[selected.id]?.notes ?? "" : "";
-  const selectedGemini = selected ? labels[selected.id]?.gemini ?? null : null;
+  const selectedVerify = selected ? labels[selected.id]?.ai_verify ?? null : null;
 
   function setSelectedLabel(label: LabelValue) {
     if (!selected) return;
@@ -87,37 +94,80 @@ export function EventDrawer(props: { events: any[]; analysisId: string }) {
 
   const labeledCount = Object.values(labels).filter((v: any) => v?.label).length;
 
-  async function runGemini() {
-    if (!selected) return;
-    setGeminiErr(null);
-    if (!geminiKey.trim()) {
-      setGeminiErr("Paste a Gemini API key first (kept in your browser; not stored on disk).");
-      return;
-    }
-    setGeminiLoading(true);
+  async function runWebVerifyBatchForRows() {
+    setVerifyErr(null);
+    const items = rows.slice(0, 10).map((e) => ({
+      id: String(e.id),
+      user_question: String(e.user_question ?? ""),
+      a1: String(e.a1_sanitized ?? ""),
+      a2: String(e.a2_sanitized ?? ""),
+      user_challenge: String(e.user_challenge ?? "")
+    }));
+    if (!items.length) return;
+    setVerifyLoading(true);
     try {
-      const res = await verifyGemini({
-        user_question: String(selected.user_question ?? ""),
-        a1: String(selected.a1_sanitized ?? ""),
-        a2: String(selected.a2_sanitized ?? ""),
-        user_challenge: String(selected.user_challenge ?? ""),
-        api_key: geminiKey.trim(),
-        model: geminiModel.trim()
+      const res = await verifyWebBatch({
+        provider: verifyProvider,
+        items,
+        max_items: 10,
       });
-      const next = {
-        ...labels,
-        [selected.id]: {
-          ...(labels[selected.id] ?? {}),
-          gemini: { model: res.model, raw: res.raw, checked_at: new Date().toISOString() },
-          updated_at: new Date().toISOString()
-        }
-      };
+      const next = { ...labels };
+      for (const r of res.results ?? []) {
+        const k = String(r.id);
+        const entry = next[k] ?? {};
+        const ai = entry.ai_verify ?? {};
+        ai[String(r.provider)] = {
+          model: r.model,
+          update_answer_correctness: r.update_answer_correctness ?? null,
+          checked_at: new Date().toISOString()
+        };
+        next[k] = { ...entry, ai_verify: ai, updated_at: new Date().toISOString() };
+      }
       setLabels(next);
       saveLabels(props.analysisId, next);
     } catch (e: any) {
-      setGeminiErr(e?.message ?? String(e));
+      setVerifyErr(e?.message ?? String(e));
     } finally {
-      setGeminiLoading(false);
+      setVerifyLoading(false);
+    }
+  }
+
+  async function runWebVerifySingle() {
+    if (!selected) return;
+    setVerifyErr(null);
+    setVerifyLoading(true);
+    try {
+      const res = await verifyWebBatch({
+        provider: verifyProvider,
+        items: [
+          {
+            id: String(selected.id),
+            user_question: String(selected.user_question ?? ""),
+            a1: String(selected.a1_sanitized ?? ""),
+            a2: String(selected.a2_sanitized ?? ""),
+            user_challenge: String(selected.user_challenge ?? "")
+          }
+        ],
+        max_items: 1
+      });
+      const next = { ...labels };
+      for (const r of res.results ?? []) {
+        const k = String(r.id);
+        const entry = next[k] ?? {};
+        const ai = entry.ai_verify ?? {};
+        ai[String(r.provider)] = {
+          model: r.model,
+          update_answer_correctness: r.update_answer_correctness ?? null,
+          checked_at: new Date().toISOString()
+        };
+        next[k] = { ...entry, ai_verify: ai, updated_at: new Date().toISOString() };
+      }
+      setLabels(next);
+      saveLabels(props.analysisId, next);
+    } catch (e: any) {
+      setVerifyErr(e?.message ?? String(e));
+    } finally {
+      setVerifyLoading(false);
     }
   }
 
@@ -138,6 +188,17 @@ export function EventDrawer(props: { events: any[]; analysisId: string }) {
               <input type="checkbox" checked={onlyUnsupported} onChange={(e) => setOnlyUnsupported(e.target.checked)} />
               Only unsupported
             </label>
+            <label
+              className="flex items-center gap-2 text-sm text-slate-300"
+              title="Requires local stance/NLI model. Filters to cases where A2 likely contradicts A1 (a stronger signal than paraphrasing)."
+            >
+              <input
+                type="checkbox"
+                checked={onlyBeliefShifts}
+                onChange={(e) => setOnlyBeliefShifts(e.target.checked)}
+              />
+              Only belief shifts
+            </label>
             <span className="pill text-xs text-slate-300">labeled: {labeledCount}</span>
             <button
               className="btn btn-ghost"
@@ -151,6 +212,9 @@ export function EventDrawer(props: { events: any[]; analysisId: string }) {
             >
               Download labels
             </button>
+            <button className="btn btn-ghost" onClick={runWebVerifyBatchForRows} disabled={verifyLoading}>
+              {verifyLoading ? "Verifying…" : "Verify filtered with AI"}
+            </button>
           </div>
         </div>
         <div className="overflow-auto rounded-xl border border-slate-800">
@@ -162,6 +226,9 @@ export function EventDrawer(props: { events: any[]; analysisId: string }) {
                   title="Gullibility score: higher means the assistant likely conceded and changed its answer after pushback."
                 >
                   Gullibility
+                </th>
+                <th className="px-3 py-2 font-medium" title="Belief shift = likely contradiction between A1 and A2 (local stance/NLI model).">
+                  Shift
                 </th>
                 <th className="px-3 py-2 font-medium">Label</th>
                 <th className="px-3 py-2 font-medium">Chat</th>
@@ -177,6 +244,7 @@ export function EventDrawer(props: { events: any[]; analysisId: string }) {
                   onClick={() => setSelected(e)}
                 >
                   <td className="px-3 py-2 font-mono text-slate-200">{Number(e.signals?.flip_likelihood ?? 0).toFixed(2)}</td>
+                  <td className="px-3 py-2 text-slate-200">{isBeliefShift(e) ? "yes" : ""}</td>
                   <td className="px-3 py-2 text-slate-200">{String(labels[e.id]?.label ?? "")}</td>
                   <td className="px-3 py-2 text-slate-200">
                     <span className="pill">{chatLabel(e)}</span>
@@ -187,7 +255,7 @@ export function EventDrawer(props: { events: any[]; analysisId: string }) {
               ))}
               {rows.length === 0 ? (
                 <tr>
-                  <td className="px-3 py-4 text-slate-400" colSpan={5}>
+                  <td className="px-3 py-4 text-slate-400" colSpan={6}>
                     No matching events.
                   </td>
                 </tr>
@@ -231,6 +299,18 @@ export function EventDrawer(props: { events: any[]; analysisId: string }) {
                     <span className="pill">resistance: {Number(selected.signals?.resistance ?? 0).toFixed(2)}</span>
                     <span className="pill">change: {(1 - Number(selected.signals?.similarity_a1_a2 ?? 0)).toFixed(2)}</span>
                   </div>
+                  {selected.nli ? (
+                    <div className="flex flex-wrap gap-2 text-xs text-slate-300">
+                      <span className="pill">NLI entail: {Number(selected.nli.entailment ?? 0).toFixed(2)}</span>
+                      <span className="pill">NLI neutral: {Number(selected.nli.neutral ?? 0).toFixed(2)}</span>
+                      <span className="pill">NLI contradict: {Number(selected.nli.contradiction ?? 0).toFixed(2)}</span>
+                      <span className="pill">belief shift: {isBeliefShift(selected) ? "yes" : "no"}</span>
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-400">
+                      No local stance/NLI result for this event (install `requirements-ml.txt` and enable the toggle).
+                    </div>
+                  )}
                   <pre className="whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-950/50 p-2 text-[11px] text-slate-200">
                     {JSON.stringify(selected.signals ?? {}, null, 2)}
                   </pre>
@@ -272,39 +352,34 @@ export function EventDrawer(props: { events: any[]; analysisId: string }) {
             </div>
 
             <div className="rounded-xl border border-slate-800 bg-slate-950/30 p-3">
-              <div className="mb-2 text-xs font-semibold text-slate-200">External verification (Gemini, optional)</div>
+              <div className="mb-2 text-xs font-semibold text-slate-200">Verify with AI (optional)</div>
               <div className="text-xs text-slate-400">
-                Sends the currently displayed <span className="font-mono">anonymized</span> A1/A2 snippet to Gemini for a judgment.
+                Sends the currently displayed <span className="font-mono">anonymized</span> snippet to a verifier. Returns only:
+                <span className="font-mono"> update_answer_correctness = TRUE/FALSE</span>.
               </div>
               <div className="mt-2 grid grid-cols-1 gap-2">
                 <label className="text-xs text-slate-400">
-                  Gemini API key
-                  <input
-                    className="input mt-1"
-                    value={geminiKey}
-                    onChange={(e) => setGeminiKey(e.target.value)}
-                    placeholder="AIza…"
-                    type="password"
-                  />
+                  Provider
+                  <select className="input mt-1" value={verifyProvider} onChange={(e) => setVerifyProvider(e.target.value as any)}>
+                    <option value="both">Gemini + OpenAI</option>
+                    <option value="gemini">Gemini (grounded web search)</option>
+                    <option value="openai">OpenAI (web search)</option>
+                  </select>
                 </label>
-                <label className="text-xs text-slate-400">
-                  Model
-                  <input className="input mt-1" value={geminiModel} onChange={(e) => setGeminiModel(e.target.value)} />
-                </label>
-                <button className="btn btn-ghost" onClick={runGemini} disabled={geminiLoading}>
-                  {geminiLoading ? "Checking…" : "Run Gemini check"}
+                <button className="btn btn-ghost" onClick={runWebVerifySingle} disabled={verifyLoading}>
+                  {verifyLoading ? "Verifying…" : "Verify with AI"}
                 </button>
-                {geminiErr ? (
+                {verifyErr ? (
                   <pre className="whitespace-pre-wrap rounded-xl border border-red-900/50 bg-red-950/40 p-2 text-[11px] text-red-200">
-                    {geminiErr}
+                    {verifyErr}
                   </pre>
                 ) : null}
-                {selectedGemini ? (
+                {selectedVerify ? (
                   <pre className="whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-950/50 p-2 text-[11px] text-slate-200">
-                    {selectedGemini.raw}
+                    {JSON.stringify(selectedVerify, null, 2)}
                   </pre>
                 ) : (
-                  <div className="text-[11px] text-slate-400">No external check run for this event yet.</div>
+                  <div className="text-[11px] text-slate-400">No AI verification run for this event yet.</div>
                 )}
               </div>
             </div>

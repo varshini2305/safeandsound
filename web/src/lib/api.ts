@@ -1,4 +1,4 @@
-export type InputType = "auto" | "chatgpt_zip" | "chatgpt_conversations_json" | "claude_conversations_json";
+export type InputType = "local" | "auto" | "chatgpt_zip" | "chatgpt_conversations_json" | "claude_conversations_json";
 
 export type AnalyzeResponse = {
   analysis_id: string;
@@ -102,7 +102,7 @@ export type AnalyzeResponse = {
   export_jsonl_truncated: boolean;
 };
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
 
 export async function analyze(form: FormData): Promise<AnalyzeResponse> {
   const res = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: form });
@@ -122,15 +122,12 @@ export async function analyzeDefault(form: FormData): Promise<AnalyzeResponse> {
   return (await res.json()) as AnalyzeResponse;
 }
 
-export async function verifyGemini(payload: {
-  user_question: string;
-  a1: string;
-  a2: string;
-  user_challenge?: string | null;
-  api_key?: string;
-  model?: string;
-}): Promise<{ model: string; raw: string }> {
-  const res = await fetch(`${API_BASE}/api/verify_gemini`, {
+export async function verifyWebBatch(payload: {
+  provider: "gemini" | "openai" | "both";
+  items: Array<{ id: string; user_question: string; a1: string; a2: string; user_challenge?: string | null }>;
+  max_items?: number;
+}): Promise<{ results: Array<{ id: string; provider: string; model: string; update_answer_correctness: boolean | null; raw: any }> }> {
+  const res = await fetch(`${API_BASE}/api/verify_web_batch`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)

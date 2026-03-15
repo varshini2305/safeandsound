@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { analyze, analyzeDefault, downloadUrl, type AnalyzeResponse, type InputType } from "@/lib/api";
+import { analyzeLocal } from "@/lib/localAnalyze";
 import { Section } from "@/components/Section";
 import { Stat } from "@/components/Stat";
 import { Table } from "@/components/Table";
@@ -24,6 +25,9 @@ export default function Page() {
   const [data, setData] = useState<AnalyzeResponse | null>(null);
   const [selectedCandidateIds, setSelectedCandidateIds] = useState<Record<string, boolean>>({});
   const [showSycophancy, setShowSycophancy] = useState(false);
+  const [processLocally, setProcessLocally] = useState(true);
+  const [abortCtl, setAbortCtl] = useState<AbortController | null>(null);
+  const [shareStatus, setShareStatus] = useState<string | null>(null);
   const [highlightTypes, setHighlightTypes] = useState<Record<string, boolean>>({
     EMAIL: true,
     PHONE: true,
@@ -62,28 +66,38 @@ export default function Page() {
       setErr("Select a file first.");
       return;
     }
-    const form = new FormData();
-    form.set("input_type", inputType);
-    form.set("file", file);
-    form.set("salt", salt);
-    form.set("mode", mode);
-    form.set("redact_urls", String(redactUrls));
-    form.set("advanced_pii", String(advancedPii));
-    form.set("candidate_min_score", String(candidateMinScore));
-    form.set("enable_nli", String(enableNli));
-    form.set("nli_model", nliModel);
     setLoading(true);
+    const ctl = new AbortController();
+    setAbortCtl(ctl);
     try {
-      const res = await analyze(form);
+      let res: AnalyzeResponse;
+      if (processLocally) {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        res = (await analyzeLocal(bytes, { filename: file.name, salt, candidateMinScore }, ctl.signal)) as any;
+      } else {
+        const form = new FormData();
+        form.set("input_type", inputType);
+        form.set("file", file);
+        form.set("salt", salt);
+        form.set("mode", mode);
+        form.set("redact_urls", String(redactUrls));
+        form.set("advanced_pii", String(advancedPii));
+        form.set("candidate_min_score", String(candidateMinScore));
+        form.set("enable_nli", String(enableNli));
+        form.set("nli_model", nliModel);
+        res = await analyze(form);
+      }
       setData(res);
       const nextSel: Record<string, boolean> = {};
       for (const c of res.challenge_candidates ?? []) nextSel[c.id] = true;
       setSelectedCandidateIds(nextSel);
       setShowSycophancy(false);
     } catch (e: any) {
-      setErr(e?.message ?? String(e));
+      if (e?.name === "AbortError") setErr("Canceled.");
+      else setErr(e?.message ?? String(e));
     } finally {
       setLoading(false);
+      setAbortCtl(null);
     }
   }
 
@@ -144,9 +158,11 @@ export default function Page() {
         <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/30 p-4 text-sm text-slate-200">
           <div className="text-sm font-semibold">Privacy & safety</div>
           <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-300">
-            <li>Runs on your machine (frontend + local backend). Your raw export is not uploaded to a cloud service.</li>
+            <li>
+              If you enable <span className="font-mono">Process locally in your browser</span>, your raw export is analyzed on-device and is not uploaded.
+            </li>
             <li>Anonymization happens before any optional external verification.</li>
-            <li>Gemini verification is opt-in and only sends the currently displayed anonymized snippet.</li>
+            <li>External verification is opt-in and only sends the currently displayed anonymized snippet.</li>
           </ul>
         </div>
       </Section>
@@ -242,12 +258,26 @@ export default function Page() {
             <p className="mt-1 text-sm text-slate-300">
               This will parse conversations, anonymize PII, extract sway events, and prepare a JSONL export.
             </p>
+            <label className="mt-3 flex items-center gap-2 text-sm text-slate-300">
+              <input type="checkbox" checked={processLocally} onChange={(e) => setProcessLocally(e.target.checked)} />
+              Process locally in your browser (no upload)
+            </label>
             <button className="btn btn-primary mt-4 w-full" onClick={onAnalyze} disabled={loading}>
               {loading ? "Analyzing…" : "Analyze"}
             </button>
-            <button className="btn btn-ghost mt-2 w-full" onClick={onAnalyzeDefault} disabled={loading}>
-              {loading ? "Analyzing…" : "Use default local dump"}
+            {loading && abortCtl ? (
+              <button className="btn btn-ghost mt-2 w-full" onClick={() => abortCtl.abort()}>
+                Cancel
+              </button>
+            ) : null}
+            <button className="btn btn-ghost mt-2 w-full" onClick={onAnalyzeDefault} disabled={loading || processLocally}>
+              {loading ? "Analyzing…" : "Use default local dump (server)"}
             </button>
+            {processLocally ? (
+              <div className="mt-2 text-xs text-slate-400">
+                Note: <span className="font-mono">Use default local dump</span> runs on the server and is not local-first.
+              </div>
+            ) : null}
             {err ? (
               <pre className="mt-3 whitespace-pre-wrap rounded-xl border border-red-900/50 bg-red-950/40 p-3 text-xs text-red-200">
                 {err}
@@ -269,7 +299,7 @@ export default function Page() {
             title="Privacy risks (PII & secrets)"
             subtitle="We scan locally for things like emails, phone numbers, addresses, API keys, and payment details, then anonymize them."
           >
-            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <div className="grid grid-cols-1 gap-4">
               <Table
                 columns={[
                   {
@@ -293,34 +323,6 @@ export default function Page() {
                 ]}
                 rows={counts}
                 empty="No PII detected."
-              />
-              <Table
-                columns={[
-                  {
-                    key: "conversation_id",
-                    header: (
-                      <span>
-                        Chat
-                        <InfoTip text="A simple chat label (Chat 1, Chat 2, …). Raw IDs are hidden in the UI." />
-                      </span>
-                    ) as any,
-                    render: (r) => <span className="pill">{convoLabel(String(r.conversation_id))}</span>
-                  },
-                  {
-                    key: "detected_spans",
-                    header: (
-                      <span>
-                        Sensitive items
-                        <InfoTip text="Number of detected sensitive snippets/spans in that chat (before anonymization)." />
-                      </span>
-                    ) as any
-                  }
-                ]}
-                rows={data.pii_summary.top_conversations.map((r) => ({
-                  conversation_id: r.conversation_id,
-                  detected_spans: r.detected_spans
-                }))}
-                empty="No sensitive conversations."
               />
             </div>
           </Section>
@@ -357,7 +359,7 @@ export default function Page() {
             <details className="mt-4 card p-4">
               <summary className="cursor-pointer select-none text-sm font-semibold">Scoring details (exact heuristic)</summary>
               <div className="mt-3 text-sm text-slate-300">
-                SwayBench uses simple, transparent rules (no hidden model) to rank review priority. Key pieces:
+                Safe and Sound uses simple, transparent rules (no hidden model) to rank review priority. Key pieces:
                 <ul className="mt-2 list-disc space-y-1 pl-5">
                   <li>
                     <span className="font-semibold">Apology/acceptance</span> (“you’re right”, “my mistake”, “I apologize”…)
@@ -683,13 +685,64 @@ if supported: gullibility *= 0.6`}
 
           <Section title="Downloads + metrics" subtitle="Exports are generated from anonymized content in-memory.">
             <div className="flex flex-wrap gap-3">
-              <a className="btn btn-primary" href={downloadUrl(data.download.jsonl)}>
-                Download SwayBench JSONL
-              </a>
-              <a className="btn btn-ghost" href={downloadUrl(data.download.sanitized_bundle)}>
-                Download anonymized bundle JSON
-              </a>
+              {data.download?.jsonl ? (
+                <a className="btn btn-primary" href={downloadUrl(data.download.jsonl)}>
+                  Download benchmark JSONL
+                </a>
+              ) : (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => {
+                    const lines = (data.events ?? []).map((e: any) => JSON.stringify(e));
+                    const blob = new Blob([lines.join("\n") + "\n"], { type: "application/jsonl" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = "safe-and-sound-benchmark.jsonl";
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                >
+                  Download benchmark JSONL
+                </button>
+              )}
+              {data.download?.sanitized_bundle ? (
+                <a className="btn btn-ghost" href={downloadUrl(data.download.sanitized_bundle)}>
+                  Download anonymized bundle JSON
+                </a>
+              ) : null}
+              <button
+                className="btn btn-ghost"
+                onClick={async () => {
+                  setShareStatus(null);
+                  try {
+                    const res = await fetch("/api/share", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        items: data.events,
+                        meta: { app: "Safe and Sound", analysis_id: data.analysis_id }
+                      })
+                    });
+                    const txt = await res.text();
+                    if (!res.ok) throw new Error(txt);
+                    const obj = JSON.parse(txt);
+                    setShareStatus(
+                      `Uploaded: ${obj.db}.${obj.collection} batch_id=${obj.batch_id}, inserted=${obj.inserted}`
+                    );
+                  } catch (e: any) {
+                    setShareStatus(e?.message ?? String(e));
+                  }
+                }}
+              >
+                Upload anonymized benchmark to MongoDB
+              </button>
             </div>
+            {shareStatus ? (
+              <pre className="mt-3 whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-200">
+                {shareStatus}
+              </pre>
+            ) : null}
             <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/50 p-4 text-sm">
               <div className="mb-2 text-sm font-semibold">Replay metrics</div>
               <pre className="whitespace-pre-wrap text-xs text-slate-200">{JSON.stringify(data.replay_metrics, null, 2)}</pre>
