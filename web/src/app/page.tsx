@@ -63,6 +63,10 @@ export default function Page() {
     setErr(null);
     setData(null);
     if (!file) {
+      if (processLocally) {
+        await onUseExample();
+        return;
+      }
       setErr("Select a file first.");
       return;
     }
@@ -87,6 +91,32 @@ export default function Page() {
         form.set("nli_model", nliModel);
         res = await analyze(form);
       }
+      setData(res);
+      const nextSel: Record<string, boolean> = {};
+      for (const c of res.challenge_candidates ?? []) nextSel[c.id] = true;
+      setSelectedCandidateIds(nextSel);
+      setShowSycophancy(false);
+    } catch (e: any) {
+      if (e?.name === "AbortError") setErr("Canceled.");
+      else setErr(e?.message ?? String(e));
+    } finally {
+      setLoading(false);
+      setAbortCtl(null);
+    }
+  }
+
+  async function onUseExample() {
+    setErr(null);
+    setData(null);
+    setLoading(true);
+    setProcessLocally(true);
+    const ctl = new AbortController();
+    setAbortCtl(ctl);
+    try {
+      const resp = await fetch("/demo/chat_export.json", { cache: "no-store", signal: ctl.signal });
+      if (!resp.ok) throw new Error(`Failed to load example export (${resp.status})`);
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      const res = (await analyzeLocal(bytes, { filename: "chat_export.json", salt, candidateMinScore }, ctl.signal)) as any;
       setData(res);
       const nextSel: Record<string, boolean> = {};
       for (const c of res.challenge_candidates ?? []) nextSel[c.id] = true;
@@ -264,6 +294,9 @@ export default function Page() {
             </label>
             <button className="btn btn-primary mt-4 w-full" onClick={onAnalyze} disabled={loading}>
               {loading ? "Analyzing…" : "Analyze"}
+            </button>
+            <button className="btn btn-ghost mt-2 w-full" onClick={onUseExample} disabled={loading}>
+              {loading ? "Analyzing…" : "Try example export (built-in)"}
             </button>
             {loading && abortCtl ? (
               <button className="btn btn-ghost mt-2 w-full" onClick={() => abortCtl.abort()}>
